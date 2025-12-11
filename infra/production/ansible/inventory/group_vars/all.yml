@@ -1,0 +1,43 @@
+---
+# ============================================================================
+# Group Variables - All Hosts
+# ============================================================================
+
+# Project Configuration
+project_name: microservices-platform
+aws_region: ap-southeast-1
+
+# Application Configuration
+app_base_dir: /opt/microservices
+docker_compose_version: "2.23.0"
+
+# Service Ports
+service_ports:
+  user_service: 8081
+  product_service: 8082
+  transaction_service: 8083
+  wallet_service: 8084
+  notify_service: 8085
+  chat_core_service: 8091
+  chat_fanout_service: 8092
+  chat_socket_service: 8093
+
+# Docker Images
+docker_registry: "" # Leave empty for Docker Hub, or use ECR: 123456789012.dkr.ecr.region.amazonaws.com
+docker_image_tag: latest
+
+# Java Configuration
+java_version: "21"
+java_opts: "-Xms512m -Xmx2048m -XX:+UseG1GC"
+
+# Logging
+log_level: INFO
+log_dir: "{{ app_base_dir }}/logs"
+
+# Health Check
+health_check_retries: 5
+health_check_delay: 10
+
+# Deployment Strategy
+rolling_update: true
+max_unavailable: 1

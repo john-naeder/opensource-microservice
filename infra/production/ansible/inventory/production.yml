@@ -1,0 +1,43 @@
+# ============================================================================
+# Ansible Inventory - Production Environment
+# ============================================================================
+
+all:
+  vars:
+    ansible_user: ubuntu
+    ansible_ssh_private_key_file: ~/.ssh/microservices-prod-key.pem
+    ansible_python_interpreter: /usr/bin/python3
+    environment_name: production
+    
+  children:
+    app_servers:
+      hosts:
+        # These will be populated dynamically from Terraform outputs
+        # Or manually add EC2 public IPs/DNS names here:
+        # app-server-1:
+        #   ansible_host: 10.0.1.10
+        # app-server-2:
+        #   ansible_host: 10.0.1.11
+        # app-server-3:
+        #   ansible_host: 10.0.1.12
+      vars:
+        ansible_connection: ssh
+        
+    databases:
+      hosts:
+        mysql:
+          # Populated from Terraform output
+          # ansible_host: "{{ mysql_endpoint }}"
+        docdb:
+          # Populated from Terraform output
+          # ansible_host: "{{ docdb_endpoint }}"
+      vars:
+        ansible_connection: local
+        
+    cache:
+      hosts:
+        redis:
+          # Populated from Terraform output
+          # ansible_host: "{{ redis_endpoint }}"
+      vars:
+        ansible_connection: local

@@ -1,0 +1,541 @@
+# ============================================================================
+# ALL-IN-ONE DEVELOPMENT ENVIRONMENT
+# ============================================================================
+#
+# Purpose: Complete development environment with ALL services on single machine
+# Usage: docker-compose -f docker-compose.dev.yml up -d
+#
+# This includes:
+#   - All infrastructure (MySQL, MongoDB, Redis, Kafka, Elasticsearch)
+#   - All 8 microservices (user, product, transaction, wallet, notify, chat x3)
+#   - Frontend application
+#   - Management UIs (phpMyAdmin, Mongo Express, Kafka UI, Kibana, Redis Commander, MailHog)
+#
+# Quick Commands:
+#   docker-compose -f docker-compose.dev.yml up -d          # Start all
+#   docker-compose -f docker-compose.dev.yml logs -f <svc>  # View logs
+#   docker-compose -f docker-compose.dev.yml down           # Stop all
+#   docker-compose -f docker-compose.dev.yml down -v        # Stop + remove volumes
+#
+# Access Points:
+#   Frontend:         http://localhost:3000
+#   phpMyAdmin:       http://localhost:8083 (user: root, pass: rootpassword)
+#   Mongo Express:    http://localhost:8082 (user: admin, pass: admin)
+#   Kafka UI:         http://localhost:8080
+#   Kibana:           http://localhost:5601
+#   Redis Commander:  http://localhost:8081
+#   MailHog UI:       http://localhost:8025
+#
+# ============================================================================
+
+version: '3.8'
+
+services:
+  # ==========================================
+  # INFRASTRUCTURE - DATABASES
+  # ==========================================
+
+  mysql:
+    image: mysql:8.0
+    container_name: dev-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpassword}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-ecommerce_db}
+      TZ: Asia/Ho_Chi_Minh
+    ports:
+      - "${MYSQL_PORT:-3306}:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./infra/local/init-scripts/mysql:/docker-entrypoint-initdb.d:ro
+    networks:
+      - dev-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-proot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    command: --default-authentication-plugin=mysql_native_password --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+
+  mongodb:
+    image: mongo:7.0
+    container_name: dev-mongodb
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGODB_ROOT_USERNAME:-root}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGODB_ROOT_PASSWORD:-rootpassword}
+    ports:
+      - "${MONGODB_PORT:-27017}:27017"
+    volumes:
+      - mongodb_data:/data/db
+      - mongodb_config:/data/configdb
+      - ./infra/local/init-scripts/mongodb:/docker-entrypoint-initdb.d:ro
+    networks:
+      - dev-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ==========================================
+  # INFRASTRUCTURE - CACHE & MESSAGING
+  # ==========================================
+
+  redis:
+    image: redis:7-alpine
+    container_name: dev-redis
+    command: redis-server --appendonly yes ${REDIS_PASSWORD:+--requirepass $REDIS_PASSWORD}
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - dev-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: bitnami/kafka:4.0
+    container_name: dev-kafka
+    ports:
+      - "${KAFKA_PORT:-9092}:9092"
+      - "9093:9093"
+      - "9094:9094"
+    environment:
+      # KRaft mode configuration
+      - KAFKA_ENABLE_KRAFT=yes
+      - KAFKA_CFG_NODE_ID=1
+      - KAFKA_CFG_PROCESS_ROLES=broker,controller
+      - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094
+      - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=1@kafka:9093
+      - ALLOW_PLAINTEXT_LISTENER=yes
+      - KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE=true
+      # Performance tuning
+      - KAFKA_CFG_NUM_PARTITIONS=3
+      - KAFKA_CFG_DEFAULT_REPLICATION_FACTOR=1
+      - KAFKA_CFG_LOG_RETENTION_HOURS=168
+    volumes:
+      - kafka_data:/bitnami/kafka
+    networks:
+      - dev-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.14.0
+    container_name: dev-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - xpack.security.enrollment.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+      - cluster.name=dev-cluster
+      - node.name=dev-node
+    ports:
+      - "${ELASTICSEARCH_PORT:-9200}:9200"
+      - "9300:9300"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    networks:
+      - dev-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ==========================================
+  # MANAGEMENT UIs
+  # ==========================================
+
+  phpmyadmin:
+    image: phpmyadmin:latest
+    container_name: dev-phpmyadmin
+    ports:
+      - "8083:80"
+    environment:
+      PMA_HOST: mysql
+      PMA_PORT: 3306
+      PMA_USER: root
+      PMA_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpassword}
+      UPLOAD_LIMIT: 100M
+    depends_on:
+      - mysql
+    networks:
+      - dev-network
+    restart: unless-stopped
+
+  mongo-express:
+    image: mongo-express:latest
+    container_name: dev-mongo-express
+    ports:
+      - "8082:8081"
+    environment:
+      ME_CONFIG_MONGODB_ADMINUSERNAME: ${MONGODB_ROOT_USERNAME:-root}
+      ME_CONFIG_MONGODB_ADMINPASSWORD: ${MONGODB_ROOT_PASSWORD:-rootpassword}
+      ME_CONFIG_MONGODB_URL: mongodb://${MONGODB_ROOT_USERNAME:-root}:${MONGODB_ROOT_PASSWORD:-rootpassword}@mongodb:27017/
+      ME_CONFIG_BASICAUTH_USERNAME: admin
+      ME_CONFIG_BASICAUTH_PASSWORD: admin
+    depends_on:
+      - mongodb
+    networks:
+      - dev-network
+    restart: unless-stopped
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: dev-kafka-ui
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      DYNAMIC_CONFIG_ENABLED: 'true'
+    depends_on:
+      - kafka
+    networks:
+      - dev-network
+    restart: unless-stopped
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.14.0
+    container_name: dev-kibana
+    ports:
+      - "5601:5601"
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+    depends_on:
+      - elasticsearch
+    networks:
+      - dev-network
+    restart: unless-stopped
+
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: dev-redis-commander
+    ports:
+      - "8081:8081"
+    environment:
+      REDIS_HOSTS: local:redis:6379
+    depends_on:
+      - redis
+    networks:
+      - dev-network
+    restart: unless-stopped
+
+  mailhog:
+    image: mailhog/mailhog:latest
+    container_name: dev-mailhog
+    ports:
+      - "1025:1025"  # SMTP
+      - "8025:8025"  # Web UI
+    networks:
+      - dev-network
+    restart: unless-stopped
+
+  # ==========================================
+  # E-COMMERCE SERVICES
+  # ==========================================
+
+  ecommerce-user:
+    build: ./services/ecommerce-sys/user
+    container_name: dev-ecommerce-user
+    ports:
+      - "${USER_SERVICE_PORT:-8091}:8080"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/${USER_DB_NAME:-user_db}?createDatabaseIfNotExist=true
+      SPRING_DATASOURCE_USERNAME: ${USER_DB_USERNAME:-root}
+      SPRING_DATASOURCE_PASSWORD: ${USER_DB_PASSWORD:-rootpassword}
+      SPRING_DATA_MONGODB_URI: mongodb://${MONGODB_ROOT_USERNAME:-root}:${MONGODB_ROOT_PASSWORD:-rootpassword}@mongodb:27017/${USER_MONGODB_DB:-logdb}?authSource=admin
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SPRING_KAFKA_CONSUMER_GROUP_ID: ${USER_KAFKA_GROUP_ID:-user-service}
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+      SPRING_DATA_REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      FILE_UPLOAD_DIR: ${USER_FILE_UPLOAD_DIR:-uploads}
+      FILE_BASE_URL: ${USER_FILE_BASE_URL:-http://localhost:8091/files}
+      SECURITY_SECRET_TOKENS_ACCESS_TOKEN_SECRET: ${JWT_ACCESS_TOKEN_SECRET}
+      SECURITY_SECRET_TOKENS_ACCESS_TOKEN_EXPIRATION: ${JWT_ACCESS_TOKEN_EXPIRATION:-3600000}
+      SECURITY_SECRET_TOKENS_REFRESH_TOKEN_SECRET: ${JWT_REFRESH_TOKEN_SECRET}
+      SECURITY_SECRET_TOKENS_REFRESH_TOKEN_EXPIRATION: ${JWT_REFRESH_TOKEN_EXPIRATION:-604800000}
+      SECURITY_SECRET_AES_KEY: ${AES_KEY}
+      SECURITY_SECRET_AES_IV: ${AES_IV}
+    volumes:
+      - user_uploads:/app/uploads
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    networks:
+      - dev-network
+    restart: unless-stopped
+
+  ecommerce-product:
+    build: ./services/ecommerce-sys/product
+    container_name: dev-ecommerce-product
+    ports:
+      - "${PRODUCT_SERVICE_PORT:-8092}:8080"
+    environment:
+      SPRING_DATA_MONGODB_URI: mongodb://${MONGODB_ROOT_USERNAME:-root}:${MONGODB_ROOT_PASSWORD:-rootpassword}@mongodb:27017/${PRODUCT_MONGODB_DB:-product}?authSource=admin
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SPRING_KAFKA_CONSUMER_GROUP_ID: ${PRODUCT_KAFKA_GROUP_ID:-product-service}
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+      SPRING_DATA_REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      ELASTICSEARCH_URIS: http://elasticsearch:9200
+      FILE_UPLOAD_DIR: ${PRODUCT_FILE_UPLOAD_DIR:-uploads}
+      FILE_BASE_URL: ${PRODUCT_FILE_BASE_URL:-http://localhost:8092/files}
+      SEARCH_CACHE_TTL: ${PRODUCT_SEARCH_CACHE_TTL:-300}
+      SEARCH_MAX_PAGE_SIZE: ${PRODUCT_SEARCH_MAX_PAGE_SIZE:-100}
+      SEARCH_DEFAULT_PAGE_SIZE: ${PRODUCT_SEARCH_DEFAULT_PAGE_SIZE:-20}
+    volumes:
+      - product_uploads:/app/uploads
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - dev-network
+    restart: unless-stopped
+
+  ecommerce-transaction:
+    build: ./services/ecommerce-sys/transaction
+    container_name: dev-ecommerce-transaction
+    ports:
+      - "${TRANSACTION_SERVICE_PORT:-8093}:8080"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/${TRANSACTION_DB_NAME:-transaction_db}?createDatabaseIfNotExist=true
+      SPRING_DATASOURCE_USERNAME: ${TRANSACTION_DB_USERNAME:-root}
+      SPRING_DATASOURCE_PASSWORD: ${TRANSACTION_DB_PASSWORD:-rootpassword}
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SPRING_KAFKA_CONSUMER_GROUP_ID: ${TRANSACTION_KAFKA_GROUP_ID:-transaction-service}
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+      SPRING_DATA_REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      FILE_UPLOAD_DIR: ${TRANSACTION_FILE_UPLOAD_DIR:-uploads}
+      FILE_BASE_URL: ${TRANSACTION_FILE_BASE_URL:-http://localhost:8093/files}
+    volumes:
+      - transaction_uploads:/app/uploads
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    networks:
+      - dev-network
+    restart: unless-stopped
+
+  ecommerce-wallet:
+    build: ./services/ecommerce-sys/wallet
+    container_name: dev-ecommerce-wallet
+    ports:
+      - "${WALLET_SERVICE_PORT:-8094}:8080"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/${WALLET_DB_NAME:-wallet_db}?createDatabaseIfNotExist=true
+      SPRING_DATASOURCE_USERNAME: ${WALLET_DB_USERNAME:-root}
+      SPRING_DATASOURCE_PASSWORD: ${WALLET_DB_PASSWORD:-rootpassword}
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SPRING_KAFKA_CONSUMER_GROUP_ID: ${WALLET_KAFKA_GROUP_ID:-wallet-service}
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+      SPRING_DATA_REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    networks:
+      - dev-network
+    restart: unless-stopped
+
+  ecommerce-notify:
+    build: ./services/ecommerce-sys/notify
+    container_name: dev-ecommerce-notify
+    ports:
+      - "${NOTIFY_SERVICE_PORT:-8095}:8080"
+    environment:
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SPRING_KAFKA_CONSUMER_GROUP_ID: ${NOTIFY_KAFKA_GROUP_ID:-notify-service}
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+      SPRING_DATA_REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      SPRING_MAIL_HOST: ${NOTIFY_MAIL_HOST:-mailhog}
+      SPRING_MAIL_PORT: ${NOTIFY_MAIL_PORT:-1025}
+      SPRING_MAIL_USERNAME: ${NOTIFY_MAIL_USERNAME:-}
+      SPRING_MAIL_PASSWORD: ${NOTIFY_MAIL_PASSWORD:-}
+      SPRING_MAIL_PROPERTIES_MAIL_SMTP_AUTH: ${NOTIFY_MAIL_SMTP_AUTH:-false}
+      SPRING_MAIL_PROPERTIES_MAIL_SMTP_STARTTLS_ENABLE: ${NOTIFY_MAIL_SMTP_STARTTLS:-false}
+    depends_on:
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      mailhog:
+        condition: service_started
+    networks:
+      - dev-network
+    restart: unless-stopped
+
+  # ==========================================
+  # CHAT SERVICES
+  # ==========================================
+
+  chat-core:
+    build: ./services/Chat-system/core-services
+    container_name: dev-chat-core
+    ports:
+      - "${CHAT_CORE_SERVICE_PORT:-8096}:8080"
+      - "${CHAT_CORE_GRPC_PORT:-9090}:9090"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/${CHAT_DB_NAME:-slack_clone}?createDatabaseIfNotExist=true
+      SPRING_DATASOURCE_USERNAME: ${CHAT_DB_USERNAME:-root}
+      SPRING_DATASOURCE_PASSWORD: ${CHAT_DB_PASSWORD:-rootpassword}
+      SPRING_DATA_MONGODB_URI: mongodb://${MONGODB_ROOT_USERNAME:-root}:${MONGODB_ROOT_PASSWORD:-rootpassword}@mongodb:27017/${CHAT_MONGODB_DB:-logdb}?authSource=admin
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SPRING_KAFKA_CONSUMER_GROUP_ID: ${CHAT_KAFKA_GROUP_ID:-chat-core-service}
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+      SPRING_DATA_REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      OUTBOX_FALLBACK_BATCH_SIZE: ${CHAT_OUTBOX_BATCH_SIZE:-100}
+      OUTBOX_FALLBACK_MAX_CONCURRENT: ${CHAT_OUTBOX_MAX_CONCURRENT:-10}
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    networks:
+      - dev-network
+    restart: unless-stopped
+
+  chat-fanout:
+    build: ./services/Chat-system/fanout_worker
+    container_name: dev-chat-fanout
+    ports:
+      - "${CHAT_FANOUT_SERVICE_PORT:-8097}:8080"
+    environment:
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SPRING_KAFKA_CONSUMER_GROUP_ID: ${CHAT_FANOUT_KAFKA_GROUP_ID:-chat-fanout-worker}
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+      SPRING_DATA_REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      GRPC_CLIENT_CORE_SERVICES_ADDRESS: static://chat-core:9090
+    depends_on:
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      chat-core:
+        condition: service_started
+    networks:
+      - dev-network
+    restart: unless-stopped
+
+  chat-socket:
+    build: ./services/Chat-system/socket_gateway
+    container_name: dev-chat-socket
+    ports:
+      - "${CHAT_SOCKET_SERVICE_PORT:-8098}:8080"
+    environment:
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+      SPRING_DATA_REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      GRPC_CLIENT_CORE_SERVICES_ADDRESS: static://chat-core:9090
+    depends_on:
+      redis:
+        condition: service_healthy
+      chat-core:
+        condition: service_started
+    networks:
+      - dev-network
+    restart: unless-stopped
+
+  # ==========================================
+  # FRONTEND
+  # ==========================================
+
+  frontend:
+    build:
+      context: ./frontends/ecommerce-sys-fe/my-app
+      args:
+        VITE_AUTH_API_URL: ${VITE_API_URL:-http://localhost:8091}
+        VITE_PRODUCT_API_URL: ${VITE_PRODUCT_API_URL:-http://localhost:8092}
+        VITE_TRANSACTION_API_URL: ${VITE_TRANSACTION_API_URL:-http://localhost:8093}
+        VITE_WALLET_API_URL: ${VITE_WALLET_API_URL:-http://localhost:8094}
+        VITE_NOTIFY_WS_URL: ${VITE_NOTIFY_WS_URL:-ws://localhost:8095}
+        VITE_CHAT_API_URL: ${VITE_CHAT_API_URL:-http://localhost:8096}
+        VITE_CHAT_WS_URL: ${VITE_CHAT_WS_URL:-ws://localhost:8098}
+    container_name: dev-ecommerce-frontend
+    ports:
+      - "${FRONTEND_PORT:-3000}:80"
+    depends_on:
+      - ecommerce-user
+      - ecommerce-product
+      - ecommerce-transaction
+      - ecommerce-wallet
+      - ecommerce-notify
+      - chat-core
+      - chat-socket
+    networks:
+      - dev-network
+    restart: unless-stopped
+
+# ==========================================
+# NETWORKS
+# ==========================================
+
+networks:
+  dev-network:
+    driver: bridge
+    name: microservices-dev-net
+
+# ==========================================
+# VOLUMES
+# ==========================================
+
+volumes:
+  mysql_data:
+    name: dev_mysql_data
+  mongodb_data:
+    name: dev_mongodb_data
+  mongodb_config:
+    name: dev_mongodb_config
+  redis_data:
+    name: dev_redis_data
+  kafka_data:
+    name: dev_kafka_data
+  elasticsearch_data:
+    name: dev_elasticsearch_data
+  user_uploads:
+    name: dev_user_uploads
+  product_uploads:
+    name: dev_product_uploads
+  transaction_uploads:
+    name: dev_transaction_uploads

@@ -1,0 +1,709 @@
+# ============================================================================
+# PRODUCTION VPS DEPLOYMENT
+# ============================================================================
+#
+# Purpose: Production-ready deployment for standalone VPS server
+# Usage: docker-compose -f docker-compose.prod-vps.yml up -d
+#
+# This configuration is optimized for:
+#   - Single VPS server (moderate resources)
+#   - All services containerized and distributed across container instances
+#   - Production-grade settings (security, persistence, resource limits)
+#   - No management UIs (use external tools for production monitoring)
+#
+# Prerequisites:
+#   1. Copy .env.production to .env and configure all variables
+#   2. Ensure sufficient server resources (minimum 8GB RAM, 4 CPU cores)
+#   3. Configure firewall rules for exposed ports
+#   4. Set up reverse proxy (Nginx/Traefik) for SSL termination
+#   5. Configure backup strategy for volumes
+#
+# Quick Commands:
+#   docker-compose -f docker-compose.prod-vps.yml up -d          # Start all
+#   docker-compose -f docker-compose.prod-vps.yml logs -f <svc>  # View logs
+#   docker-compose -f docker-compose.prod-vps.yml down           # Stop all
+#   docker-compose -f docker-compose.prod-vps.yml restart <svc>  # Restart service
+#
+# Service Ports (internal):
+#   User Service:        8091
+#   Product Service:     8092
+#   Transaction Service: 8093
+#   Wallet Service:      8094
+#   Notify Service:      8095
+#   Chat Core:           8096 (gRPC: 9090)
+#   Chat Fanout:         8097
+#   Chat Socket:         8098
+#   Frontend:            3000
+#
+# ============================================================================
+
+version: '3.8'
+
+services:
+  # ==========================================
+  # INFRASTRUCTURE - DATABASES
+  # ==========================================
+
+  mysql:
+    image: mysql:8.0
+    container_name: prod-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-ecommerce_db}
+      TZ: ${TIMEZONE:-Asia/Ho_Chi_Minh}
+    ports:
+      - "127.0.0.1:3306:3306"  # Bind to localhost only
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./infra/local/init-scripts/mysql:/docker-entrypoint-initdb.d:ro
+      - ./backups/mysql:/backups
+    networks:
+      - prod-network
+    restart: always
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    command: >
+      --default-authentication-plugin=mysql_native_password
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_unicode_ci
+      --max_connections=500
+      --innodb_buffer_pool_size=1G
+      --innodb_log_file_size=256M
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  mongodb:
+    image: mongo:7.0
+    container_name: prod-mongodb
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGODB_ROOT_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGODB_ROOT_PASSWORD}
+    ports:
+      - "127.0.0.1:27017:27017"  # Bind to localhost only
+    volumes:
+      - mongodb_data:/data/db
+      - mongodb_config:/data/configdb
+      - ./infra/local/init-scripts/mongodb:/docker-entrypoint-initdb.d:ro
+      - ./backups/mongodb:/backups
+    networks:
+      - prod-network
+    restart: always
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    command: --wiredTigerCacheSizeGB 1.5
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ==========================================
+  # INFRASTRUCTURE - CACHE & MESSAGING
+  # ==========================================
+
+  redis:
+    image: redis:7-alpine
+    container_name: prod-redis
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD}
+      --appendonly yes
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+    ports:
+      - "127.0.0.1:6379:6379"  # Bind to localhost only
+    volumes:
+      - redis_data:/data
+    networks:
+      - prod-network
+    restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  kafka:
+    image: bitnami/kafka:4.0
+    container_name: prod-kafka
+    ports:
+      - "127.0.0.1:9092:9092"  # Bind to localhost only
+    environment:
+      # KRaft mode configuration
+      - KAFKA_ENABLE_KRAFT=yes
+      - KAFKA_CFG_NODE_ID=1
+      - KAFKA_CFG_PROCESS_ROLES=broker,controller
+      - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093
+      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092
+      - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=1@kafka:9093
+      - ALLOW_PLAINTEXT_LISTENER=yes
+      - KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE=true
+      # Production tuning
+      - KAFKA_CFG_NUM_PARTITIONS=6
+      - KAFKA_CFG_DEFAULT_REPLICATION_FACTOR=1
+      - KAFKA_CFG_LOG_RETENTION_HOURS=168
+      - KAFKA_CFG_LOG_SEGMENT_BYTES=1073741824
+      - KAFKA_CFG_LOG_RETENTION_CHECK_INTERVAL_MS=300000
+      - KAFKA_HEAP_OPTS=-Xmx1G -Xms1G
+    volumes:
+      - kafka_data:/bitnami/kafka
+    networks:
+      - prod-network
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      interval: 60s
+      timeout: 20s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.14.0
+    container_name: prod-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - xpack.security.enrollment.enabled=false
+      - "ES_JAVA_OPTS=-Xms1g -Xmx1g"
+      - cluster.name=prod-cluster
+      - node.name=prod-node
+      - bootstrap.memory_lock=true
+    ports:
+      - "127.0.0.1:9200:9200"  # Bind to localhost only
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    networks:
+      - prod-network
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 60s
+      timeout: 20s
+      retries: 3
+      start_period: 60s
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ==========================================
+  # E-COMMERCE SERVICES
+  # ==========================================
+
+  ecommerce-user:
+    build:
+      context: ./services/ecommerce-sys/user
+      dockerfile: Dockerfile
+    image: ecommerce-user:${APP_VERSION:-latest}
+    container_name: prod-ecommerce-user
+    ports:
+      - "127.0.0.1:8091:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: prod
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/${USER_DB_NAME:-user_db}
+      SPRING_DATASOURCE_USERNAME: ${USER_DB_USERNAME}
+      SPRING_DATASOURCE_PASSWORD: ${USER_DB_PASSWORD}
+      SPRING_DATA_MONGODB_URI: mongodb://${MONGODB_ROOT_USERNAME}:${MONGODB_ROOT_PASSWORD}@mongodb:27017/${USER_MONGODB_DB:-logdb}?authSource=admin
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SPRING_KAFKA_CONSUMER_GROUP_ID: ${USER_KAFKA_GROUP_ID:-user-service-prod}
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+      SPRING_DATA_REDIS_PASSWORD: ${REDIS_PASSWORD}
+      FILE_UPLOAD_DIR: /app/uploads
+      FILE_BASE_URL: ${USER_FILE_BASE_URL}
+      SECURITY_SECRET_TOKENS_ACCESS_TOKEN_SECRET: ${JWT_ACCESS_TOKEN_SECRET}
+      SECURITY_SECRET_TOKENS_ACCESS_TOKEN_EXPIRATION: ${JWT_ACCESS_TOKEN_EXPIRATION:-3600000}
+      SECURITY_SECRET_TOKENS_REFRESH_TOKEN_SECRET: ${JWT_REFRESH_TOKEN_SECRET}
+      SECURITY_SECRET_TOKENS_REFRESH_TOKEN_EXPIRATION: ${JWT_REFRESH_TOKEN_EXPIRATION:-604800000}
+      SECURITY_SECRET_AES_KEY: ${AES_KEY}
+      SECURITY_SECRET_AES_IV: ${AES_IV}
+      JAVA_OPTS: -Xmx512m -Xms256m
+    volumes:
+      - user_uploads:/app/uploads
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    networks:
+      - prod-network
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 768M
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  ecommerce-product:
+    build:
+      context: ./services/ecommerce-sys/product
+      dockerfile: Dockerfile
+    image: ecommerce-product:${APP_VERSION:-latest}
+    container_name: prod-ecommerce-product
+    ports:
+      - "127.0.0.1:8092:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: prod
+      SPRING_DATA_MONGODB_URI: mongodb://${MONGODB_ROOT_USERNAME}:${MONGODB_ROOT_PASSWORD}@mongodb:27017/${PRODUCT_MONGODB_DB:-product}?authSource=admin
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SPRING_KAFKA_CONSUMER_GROUP_ID: ${PRODUCT_KAFKA_GROUP_ID:-product-service-prod}
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+      SPRING_DATA_REDIS_PASSWORD: ${REDIS_PASSWORD}
+      ELASTICSEARCH_URIS: http://elasticsearch:9200
+      FILE_UPLOAD_DIR: /app/uploads
+      FILE_BASE_URL: ${PRODUCT_FILE_BASE_URL}
+      SEARCH_CACHE_TTL: ${PRODUCT_SEARCH_CACHE_TTL:-300}
+      SEARCH_MAX_PAGE_SIZE: ${PRODUCT_SEARCH_MAX_PAGE_SIZE:-100}
+      SEARCH_DEFAULT_PAGE_SIZE: ${PRODUCT_SEARCH_DEFAULT_PAGE_SIZE:-20}
+      JAVA_OPTS: -Xmx512m -Xms256m
+    volumes:
+      - product_uploads:/app/uploads
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    networks:
+      - prod-network
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 768M
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  ecommerce-transaction:
+    build:
+      context: ./services/ecommerce-sys/transaction
+      dockerfile: Dockerfile
+    image: ecommerce-transaction:${APP_VERSION:-latest}
+    container_name: prod-ecommerce-transaction
+    ports:
+      - "127.0.0.1:8093:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: prod
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/${TRANSACTION_DB_NAME:-transaction_db}
+      SPRING_DATASOURCE_USERNAME: ${TRANSACTION_DB_USERNAME}
+      SPRING_DATASOURCE_PASSWORD: ${TRANSACTION_DB_PASSWORD}
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SPRING_KAFKA_CONSUMER_GROUP_ID: ${TRANSACTION_KAFKA_GROUP_ID:-transaction-service-prod}
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+      SPRING_DATA_REDIS_PASSWORD: ${REDIS_PASSWORD}
+      FILE_UPLOAD_DIR: /app/uploads
+      FILE_BASE_URL: ${TRANSACTION_FILE_BASE_URL}
+      JAVA_OPTS: -Xmx512m -Xms256m
+    volumes:
+      - transaction_uploads:/app/uploads
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    networks:
+      - prod-network
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 768M
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  ecommerce-wallet:
+    build:
+      context: ./services/ecommerce-sys/wallet
+      dockerfile: Dockerfile
+    image: ecommerce-wallet:${APP_VERSION:-latest}
+    container_name: prod-ecommerce-wallet
+    ports:
+      - "127.0.0.1:8094:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: prod
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/${WALLET_DB_NAME:-wallet_db}
+      SPRING_DATASOURCE_USERNAME: ${WALLET_DB_USERNAME}
+      SPRING_DATASOURCE_PASSWORD: ${WALLET_DB_PASSWORD}
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SPRING_KAFKA_CONSUMER_GROUP_ID: ${WALLET_KAFKA_GROUP_ID:-wallet-service-prod}
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+      SPRING_DATA_REDIS_PASSWORD: ${REDIS_PASSWORD}
+      JAVA_OPTS: -Xmx512m -Xms256m
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    networks:
+      - prod-network
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 768M
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  ecommerce-notify:
+    build:
+      context: ./services/ecommerce-sys/notify
+      dockerfile: Dockerfile
+    image: ecommerce-notify:${APP_VERSION:-latest}
+    container_name: prod-ecommerce-notify
+    ports:
+      - "127.0.0.1:8095:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: prod
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SPRING_KAFKA_CONSUMER_GROUP_ID: ${NOTIFY_KAFKA_GROUP_ID:-notify-service-prod}
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+      SPRING_DATA_REDIS_PASSWORD: ${REDIS_PASSWORD}
+      SPRING_MAIL_HOST: ${NOTIFY_MAIL_HOST}
+      SPRING_MAIL_PORT: ${NOTIFY_MAIL_PORT:-587}
+      SPRING_MAIL_USERNAME: ${NOTIFY_MAIL_USERNAME}
+      SPRING_MAIL_PASSWORD: ${NOTIFY_MAIL_PASSWORD}
+      SPRING_MAIL_PROPERTIES_MAIL_SMTP_AUTH: ${NOTIFY_MAIL_SMTP_AUTH:-true}
+      SPRING_MAIL_PROPERTIES_MAIL_SMTP_STARTTLS_ENABLE: ${NOTIFY_MAIL_SMTP_STARTTLS:-true}
+      JAVA_OPTS: -Xmx384m -Xms192m
+    depends_on:
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    networks:
+      - prod-network
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # ==========================================
+  # CHAT SERVICES
+  # ==========================================
+
+  chat-core:
+    build:
+      context: ./services/Chat-system/core-services
+      dockerfile: Dockerfile
+    image: chat-core:${APP_VERSION:-latest}
+    container_name: prod-chat-core
+    ports:
+      - "127.0.0.1:8096:8080"
+      - "127.0.0.1:9090:9090"
+    environment:
+      SPRING_PROFILES_ACTIVE: prod
+      SPRING_DATASOURCE_URL: jdbc:mysql://mysql:3306/${CHAT_DB_NAME:-slack_clone}
+      SPRING_DATASOURCE_USERNAME: ${CHAT_DB_USERNAME}
+      SPRING_DATASOURCE_PASSWORD: ${CHAT_DB_PASSWORD}
+      SPRING_DATA_MONGODB_URI: mongodb://${MONGODB_ROOT_USERNAME}:${MONGODB_ROOT_PASSWORD}@mongodb:27017/${CHAT_MONGODB_DB:-logdb}?authSource=admin
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SPRING_KAFKA_CONSUMER_GROUP_ID: ${CHAT_KAFKA_GROUP_ID:-chat-core-service-prod}
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+      SPRING_DATA_REDIS_PASSWORD: ${REDIS_PASSWORD}
+      OUTBOX_FALLBACK_BATCH_SIZE: ${CHAT_OUTBOX_BATCH_SIZE:-100}
+      OUTBOX_FALLBACK_MAX_CONCURRENT: ${CHAT_OUTBOX_MAX_CONCURRENT:-10}
+      JAVA_OPTS: -Xmx512m -Xms256m
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    networks:
+      - prod-network
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 768M
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  chat-fanout:
+    build:
+      context: ./services/Chat-system/fanout_worker
+      dockerfile: Dockerfile
+    image: chat-fanout:${APP_VERSION:-latest}
+    container_name: prod-chat-fanout
+    ports:
+      - "127.0.0.1:8097:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: prod
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SPRING_KAFKA_CONSUMER_GROUP_ID: ${CHAT_FANOUT_KAFKA_GROUP_ID:-chat-fanout-worker-prod}
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+      SPRING_DATA_REDIS_PASSWORD: ${REDIS_PASSWORD}
+      GRPC_CLIENT_CORE_SERVICES_ADDRESS: static://chat-core:9090
+      JAVA_OPTS: -Xmx384m -Xms192m
+    depends_on:
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      chat-core:
+        condition: service_started
+    networks:
+      - prod-network
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  chat-socket:
+    build:
+      context: ./services/Chat-system/socket_gateway
+      dockerfile: Dockerfile
+    image: chat-socket:${APP_VERSION:-latest}
+    container_name: prod-chat-socket
+    ports:
+      - "127.0.0.1:8098:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: prod
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+      SPRING_DATA_REDIS_PASSWORD: ${REDIS_PASSWORD}
+      GRPC_CLIENT_CORE_SERVICES_ADDRESS: static://chat-core:9090
+      JAVA_OPTS: -Xmx384m -Xms192m
+    depends_on:
+      redis:
+        condition: service_healthy
+      chat-core:
+        condition: service_started
+    networks:
+      - prod-network
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # ==========================================
+  # FRONTEND
+  # ==========================================
+
+  frontend:
+    build:
+      context: ./frontends/ecommerce-sys-fe/my-app
+      dockerfile: Dockerfile
+      args:
+        VITE_AUTH_API_URL: ${VITE_API_URL}
+        VITE_PRODUCT_API_URL: ${VITE_PRODUCT_API_URL}
+        VITE_TRANSACTION_API_URL: ${VITE_TRANSACTION_API_URL}
+        VITE_WALLET_API_URL: ${VITE_WALLET_API_URL}
+        VITE_NOTIFY_WS_URL: ${VITE_NOTIFY_WS_URL}
+        VITE_CHAT_API_URL: ${VITE_CHAT_API_URL}
+        VITE_CHAT_WS_URL: ${VITE_CHAT_WS_URL}
+    image: ecommerce-frontend:${APP_VERSION:-latest}
+    container_name: prod-ecommerce-frontend
+    ports:
+      - "127.0.0.1:3000:80"
+    depends_on:
+      - ecommerce-user
+      - ecommerce-product
+      - ecommerce-transaction
+      - ecommerce-wallet
+      - ecommerce-notify
+      - chat-core
+      - chat-socket
+    networks:
+      - prod-network
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+# ==========================================
+# NETWORKS
+# ==========================================
+
+networks:
+  prod-network:
+    driver: bridge
+    name: microservices-prod-net
+
+# ==========================================
+# VOLUMES
+# ==========================================
+
+volumes:
+  mysql_data:
+    name: prod_mysql_data
+  mongodb_data:
+    name: prod_mongodb_data
+  mongodb_config:
+    name: prod_mongodb_config
+  redis_data:
+    name: prod_redis_data
+  kafka_data:
+    name: prod_kafka_data
+  elasticsearch_data:
+    name: prod_elasticsearch_data
+  user_uploads:
+    name: prod_user_uploads
+  product_uploads:
+    name: prod_product_uploads
+  transaction_uploads:
+    name: prod_transaction_uploads

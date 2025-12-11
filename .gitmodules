@@ -1,0 +1,9 @@
+[submodule "services/Chat-system"]
+	path = services/Chat-system
+	url = https://github.com/letrogthien/Chat-system.git
+[submodule "services/ecommerce-sys"]
+	path = services/ecommerce-sys
+	url = https://github.com/letrogthien/ecommerce-sys.git
+[submodule "frontends/web-client"]
+	path = frontends/web-client
+	url = https://github.com/letrogthien/ecommerce-sys-fe.git

@@ -1,0 +1,127 @@
+---
+# ============================================================================
+# Playbook: Deploy All Microservices
+# ============================================================================
+
+- name: Deploy Microservices Platform
+  hosts: app_servers
+  become: yes
+  gather_facts: yes
+  
+  vars:
+    services_to_deploy:
+      - user_service
+      - product_service
+      - transaction_service
+      - wallet_service
+      - notify_service
+      - chat_core_service
+      - chat_fanout_service
+      - chat_socket_service
+  
+  pre_tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      when: ansible_os_family == "Debian"
+    
+    - name: Gather infrastructure endpoints
+      set_fact:
+        infra_endpoints:
+          mysql_host: "{{ mysql_endpoint.split(':')[0] }}"
+          mysql_port: "{{ mysql_port }}"
+          docdb_host: "{{ docdb_endpoint.split(':')[0] }}"
+          docdb_port: "{{ docdb_port }}"
+          redis_host: "{{ redis_endpoint }}"
+          redis_port: "{{ redis_port }}"
+          kafka_brokers: "{{ kafka_brokers }}"
+          opensearch_host: "{{ opensearch_endpoint }}"
+          s3_bucket: "{{ s3_bucket }}"
+  
+  roles:
+    - common
+    - docker
+    - aws-cli
+    - cloudwatch-agent
+    - microservices
+
+  tasks:
+    - name: Ensure application directory exists
+      file:
+        path: "{{ app_base_dir }}"
+        state: directory
+        mode: '0755'
+    
+    - name: Fetch database credentials from Secrets Manager
+      command: >
+        aws secretsmanager get-secret-value
+        --secret-id {{ item.secret_id }}
+        --region {{ aws_region }}
+        --query SecretString
+        --output text
+      register: secrets
+      loop:
+        - { name: 'mysql', secret_id: '{{ mysql_secret_arn }}' }
+        - { name: 'docdb', secret_id: '{{ docdb_secret_arn }}' }
+        - { name: 'opensearch', secret_id: '{{ opensearch_secret_arn }}' }
+      no_log: true
+      changed_when: false
+    
+    - name: Parse secrets
+      set_fact:
+        db_credentials:
+          mysql: "{{ secrets.results[0].stdout | from_json }}"
+          docdb: "{{ secrets.results[1].stdout | from_json }}"
+          opensearch: "{{ secrets.results[2].stdout | from_json }}"
+      no_log: true
+    
+    - name: Create environment file
+      template:
+        src: templates/env.j2
+        dest: "{{ app_base_dir }}/.env"
+        mode: '0600'
+      no_log: true
+    
+    - name: Deploy services
+      include_role:
+        name: deploy-service
+      vars:
+        service_name: "{{ item }}"
+      loop: "{{ services_to_deploy }}"
+    
+    - name: Verify all services are healthy
+      uri:
+        url: "http://localhost:{{ service_ports[item] }}/actuator/health"
+        status_code: 200
+      register: health_check
+      until: health_check.status == 200
+      retries: "{{ health_check_retries }}"
+      delay: "{{ health_check_delay }}"
+      loop: "{{ services_to_deploy }}"
+      ignore_errors: yes
+    
+    - name: Display deployment summary
+      debug:
+        msg: |
+          ============================================
+          Deployment Summary
+          ============================================
+          Environment: Production
+          Deployed Services: {{ services_to_deploy | length }}
+          
+          Service Status:
+          {% for item in services_to_deploy %}
+          - {{ item }}: {{ 'Healthy' if health_check.results[loop.index0].status == 200 else 'Unhealthy' }}
+          {% endfor %}
+          
+          Load Balancer: {{ alb_dns }}
+          ============================================
+
+  post_tasks:
+    - name: Clean up old Docker images
+      docker_prune:
+        images: yes
+        images_filters:
+          dangling: true
+      ignore_errors: yes

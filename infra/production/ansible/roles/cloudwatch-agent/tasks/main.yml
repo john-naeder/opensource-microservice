@@ -1,0 +1,116 @@
+---
+# ============================================================================
+# Role: CloudWatch Agent - Install and configure CloudWatch agent
+# ============================================================================
+
+- name: Download CloudWatch Agent
+  get_url:
+    url: https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
+    dest: /tmp/amazon-cloudwatch-agent.deb
+  become: yes
+
+- name: Install CloudWatch Agent
+  apt:
+    deb: /tmp/amazon-cloudwatch-agent.deb
+  become: yes
+
+- name: Create CloudWatch Agent configuration
+  copy:
+    dest: /opt/aws/amazon-cloudwatch-agent/etc/config.json
+    content: |
+      {
+        "agent": {
+          "metrics_collection_interval": 60,
+          "run_as_user": "cwagent"
+        },
+        "logs": {
+          "logs_collected": {
+            "files": {
+              "collect_list": [
+                {
+                  "file_path": "{{ log_dir }}/*.log",
+                  "log_group_name": "/aws/microservices/{{ project_name }}",
+                  "log_stream_name": "{instance_id}/{hostname}",
+                  "retention_in_days": 7
+                }
+              ]
+            }
+          }
+        },
+        "metrics": {
+          "namespace": "{{ project_name }}/EC2",
+          "metrics_collected": {
+            "cpu": {
+              "measurement": [
+                {
+                  "name": "cpu_usage_idle",
+                  "rename": "CPU_IDLE",
+                  "unit": "Percent"
+                },
+                {
+                  "name": "cpu_usage_iowait",
+                  "rename": "CPU_IOWAIT",
+                  "unit": "Percent"
+                }
+              ],
+              "metrics_collection_interval": 60,
+              "totalcpu": false
+            },
+            "disk": {
+              "measurement": [
+                {
+                  "name": "used_percent",
+                  "rename": "DISK_USED",
+                  "unit": "Percent"
+                }
+              ],
+              "metrics_collection_interval": 60,
+              "resources": [
+                "*"
+              ]
+            },
+            "mem": {
+              "measurement": [
+                {
+                  "name": "mem_used_percent",
+                  "rename": "MEM_USED",
+                  "unit": "Percent"
+                }
+              ],
+              "metrics_collection_interval": 60
+            },
+            "netstat": {
+              "measurement": [
+                {
+                  "name": "tcp_established",
+                  "rename": "TCP_ESTABLISHED",
+                  "unit": "Count"
+                },
+                {
+                  "name": "tcp_time_wait",
+                  "rename": "TCP_TIME_WAIT",
+                  "unit": "Count"
+                }
+              ],
+              "metrics_collection_interval": 60
+            }
+          }
+        }
+      }
+  become: yes
+
+- name: Start CloudWatch Agent
+  command: >
+    /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl
+    -a fetch-config
+    -m ec2
+    -s
+    -c file:/opt/aws/amazon-cloudwatch-agent/etc/config.json
+  become: yes
+
+- name: Ensure CloudWatch Agent is enabled
+  service:
+    name: amazon-cloudwatch-agent
+    state: started
+    enabled: yes
+  become: yes
